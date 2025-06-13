@@ -18,7 +18,11 @@ logger = logging.getLogger(__name__)
 
 # TODO: what about `set AZURE_TRACING_GEN_AI_CONTENT_RECORDING_ENABLED=true`?
 def enable_telemetry(
-    *, destination: Union[TextIO, str, None] = None, **kwargs  # pylint: disable=unused-argument
+    *,
+    destination: Union[TextIO, str, None] = None,
+    otlp_protocol: str = "grpc",
+    processor_type: str = "batch",
+    **kwargs,  # pylint: disable=unused-argument
 ) -> None:
     """Enables telemetry collection with OpenTelemetry for Azure AI clients and popular GenAI libraries.
 
@@ -33,21 +37,25 @@ def enable_telemetry(
     `AZURE_TRACING_GEN_AI_CONTENT_RECORDING_ENABLED` environment variable to `true`.
 
     When destination is provided, the method configures OpenTelemetry SDK to export traces to
-    stdout or OTLP (OpenTelemetry protocol) gRPC endpoint. It's recommended for local
+    stdout or OTLP (OpenTelemetry protocol) endpoint. It's recommended for local
     development only. For production use, make sure to configure OpenTelemetry SDK directly.
 
     :keyword destination: Recommended for local testing only. Set it to `sys.stdout` for
         tracing to console output, or a string holding the OpenTelemetry protocol (OTLP)
-        endpoint such as "http://localhost:4317.
+        endpoint such as "http://localhost:4317".
         If not provided, the method enables instrumentations, but does not configure OpenTelemetry
         SDK to export traces.
     :paramtype destination: Union[TextIO, str, None]
+    :keyword otlp_protocol: The OTLP protocol to use, either "http" or "grpc". Defaults to "grpc".
+    :paramtype otlp_protocol: str
+    :keyword processor_type: The type of processor to use, either "simple" or "batch". Defaults to "batch".
+    :paramtype processor_type: str
     """
-    span_exporter = _get_trace_exporter(destination)
-    _configure_tracing(span_exporter)
+    span_exporter = _get_trace_exporter(destination, otlp_protocol=otlp_protocol)
+    _configure_tracing(span_exporter, processor_type=processor_type)
 
-    log_exporter = _get_log_exporter(destination)
-    _configure_logging(log_exporter)
+    log_exporter = _get_log_exporter(destination, otlp_protocol=otlp_protocol)
+    _configure_logging(log_exporter, processor_type=processor_type)
 
     # Silently try to load a set of relevant Instrumentors
     try:
@@ -103,17 +111,28 @@ def enable_telemetry(
 
 
 # Internal helper functions to enable OpenTelemetry, used by both sync and async clients
-def _get_trace_exporter(destination: Union[TextIO, str, None]) -> Any:
+def _get_trace_exporter(destination: Union[TextIO, str, None], *, otlp_protocol: str) -> Any:
     if isinstance(destination, str):
         # `destination` is the OTLP endpoint
-        # See: https://opentelemetry-python.readthedocs.io/en/latest/exporter/otlp/otlp.html#usage
-        try:
-            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # type: ignore
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError(
-                "OpenTelemetry OTLP exporter is not installed. "
-                + "Please install it using 'pip install opentelemetry-exporter-otlp-proto-grpc'"
-            ) from e
+        if otlp_protocol == "grpc":
+            try:
+                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            except ModuleNotFoundError as e:
+                raise ModuleNotFoundError(
+                    "OpenTelemetry OTLP gRPC exporter is not installed. "
+                    + "Please install it using 'pip install opentelemetry-exporter-otlp-proto-grpc'"
+                ) from e
+        elif otlp_protocol == "http":
+            try:
+                from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+            except ModuleNotFoundError as e:
+                raise ModuleNotFoundError(
+                    "OpenTelemetry OTLP HTTP exporter is not installed. "
+                    + "Please install it using 'pip install opentelemetry-exporter-otlp-proto-http'"
+                ) from e
+        else:
+            raise ValueError(f"Unsupported OTLP protocol: '{otlp_protocol}'. Please use 'http' or 'grpc'.")
+
         return OTLPSpanExporter(endpoint=destination)
 
     if isinstance(destination, io.TextIOWrapper):
@@ -132,15 +151,24 @@ def _get_trace_exporter(destination: Union[TextIO, str, None]) -> Any:
     return None
 
 
-def _get_log_exporter(destination: Union[TextIO, str, None]) -> Any:
+def _get_log_exporter(destination: Union[TextIO, str, None], *, otlp_protocol: str) -> Any:
     if isinstance(destination, str):
         # `destination` is the OTLP endpoint
-        # See: https://opentelemetry-python.readthedocs.io/en/latest/exporter/otlp/otlp.html#usage
         try:
             # _logs are considered beta (not internal) in OpenTelemetry Python API/SDK.
             # So it's ok to use it for local development, but we'll swallow
             # any errors in case of any breaking changes on OTel side.
-            from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter  # type: ignore  # pylint: disable=import-error,no-name-in-module
+            if otlp_protocol == "grpc":
+                from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
+                    OTLPLogExporter,
+                )  # type: ignore  # pylint: disable=import-error,no-name-in-module
+            elif otlp_protocol == "http":
+                from opentelemetry.exporter.otlp.proto.http._log_exporter import (
+                    OTLPLogExporter,
+                )  # type: ignore  # pylint: disable=import-error,no-name-in-module
+            else:
+                logger.warning("Unsupported OTLP protocol: '%s'. Logging will not be configured.", otlp_protocol)
+                return None
         except Exception as ex:  # pylint: disable=broad-exception-caught
             # since OTel logging is still in beta in Python, we're going to swallow any errors
             # and just warn about them.
@@ -166,14 +194,14 @@ def _get_log_exporter(destination: Union[TextIO, str, None]) -> Any:
     return None
 
 
-def _configure_tracing(span_exporter: Any) -> None:
+def _configure_tracing(span_exporter: Any, *, processor_type: str) -> None:
     if span_exporter is None:
         return
 
     try:
         from opentelemetry import trace
         from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor, BatchSpanProcessor
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
             "OpenTelemetry SDK is not installed. Please install it using 'pip install opentelemetry-sdk'"
@@ -189,10 +217,18 @@ def _configure_tracing(span_exporter: Any) -> None:
     # however, we have opentelemetry.sdk.trace.TracerProvider, which implements
     # add_span_processor method, though we need to cast it to fix type checking.
     provider = cast(TracerProvider, trace.get_tracer_provider())
-    provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+
+    if processor_type == "simple":
+        processor = SimpleSpanProcessor(span_exporter)
+    elif processor_type == "batch":
+        processor = BatchSpanProcessor(span_exporter)
+    else:
+        raise ValueError(f"Unsupported processor type: '{processor_type}'. Please use 'simple' or 'batch'.")
+
+    provider.add_span_processor(processor)
 
 
-def _configure_logging(log_exporter: Any) -> None:
+def _configure_logging(log_exporter: Any, *, processor_type: str = "simple") -> None:
     if log_exporter is None:
         return
 
@@ -206,6 +242,7 @@ def _configure_logging(log_exporter: Any) -> None:
         from opentelemetry.sdk._events import EventLoggerProvider  # pylint: disable=import-error,no-name-in-module
         from opentelemetry.sdk._logs.export import (  # pylint: disable=import-error
             SimpleLogRecordProcessor,
+            BatchLogRecordProcessor,
         )  # pylint: disable=import-error,no-name-in-module
 
         if not isinstance(_logs.get_logger_provider(), LoggerProvider):
@@ -216,7 +253,16 @@ def _configure_logging(log_exporter: Any) -> None:
         # however, we have opentelemetry.sdk._logs.LoggerProvider, which implements
         # add_log_record_processor method, though we need to cast it to fix type checking.
         logger_provider = cast(LoggerProvider, _logs.get_logger_provider())
-        logger_provider.add_log_record_processor(SimpleLogRecordProcessor(log_exporter))
+
+        if processor_type == "simple":
+            log_processor = SimpleLogRecordProcessor(log_exporter)
+        elif processor_type == "batch":
+            log_processor = BatchLogRecordProcessor(log_exporter)
+        else:
+            logger.warning("Unsupported processor type: '%s'. Logging will not be configured.", processor_type)
+            return
+
+        logger_provider.add_log_record_processor(log_processor)
         _events.set_event_logger_provider(EventLoggerProvider(logger_provider))
     except Exception as ex:  # pylint: disable=broad-exception-caught
         # since OTel logging is still in beta in Python, we're going to swallow any errors
